@@ -8,8 +8,11 @@ import com.yahoo.bard.webservice.druid.client.FailureCallback;
 import com.yahoo.bard.webservice.druid.client.HttpErrorCallback;
 import com.yahoo.bard.webservice.druid.client.SuccessCallback;
 import com.yahoo.bard.webservice.druid.model.query.DruidAggregationQuery;
+import com.yahoo.bard.webservice.druid.model.query.DruidQuery;
 import com.yahoo.bard.webservice.logging.blocks.BardQueryInfo;
 import com.yahoo.bard.webservice.web.apirequest.DataApiRequest;
+import com.yahoo.bard.webservice.web.responseprocessors.LoggingContext;
+import com.yahoo.bard.webservice.web.responseprocessors.ResponseContext;
 import com.yahoo.bard.webservice.web.responseprocessors.ResponseProcessor;
 import com.yahoo.bard.webservice.web.responseprocessors.WeightCheckResponseProcessor;
 import com.yahoo.bard.webservice.web.util.QueryWeightUtil;
@@ -19,6 +22,7 @@ import com.yahoo.bard.webservice.util.Utils;
 
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectWriter;
@@ -28,6 +32,8 @@ import com.yahoo.bard.webservice.metadata.QuerySigningService;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.util.function.Consumer;
 
 import javax.validation.constraints.NotNull;
 
@@ -44,9 +50,7 @@ import javax.validation.constraints.NotNull;
 public class CacheWeightCheckRequestHandler extends WeightCheckRequestHandler {
     private static final Logger LOG = LoggerFactory.getLogger(WeightCheckRequestHandler.class);
 
-
-    protected final @NotNull TupleDataCache<String, Long, String> dataCache;
-    protected final @NotNull QuerySigningService<Long> querySigningService;
+    CacheService cacheService;
 
     /**
      * Build a cache weight checking request handler.
@@ -55,16 +59,13 @@ public class CacheWeightCheckRequestHandler extends WeightCheckRequestHandler {
      * @param webService  The web service to use for weight checking
      * @param queryWeightUtil  A provider which measures estimated weight against allowed weights.
      * @param mapper  A JSON object mapper, used to parse the JSON response from the weight check.
-     * @param dataCache The cache instance
-     * @param querySigningService The service to generate query signatures
      */
     public CacheWeightCheckRequestHandler(
             DataRequestHandler next,
             DruidWebService webService,
             QueryWeightUtil queryWeightUtil,
             ObjectMapper mapper,
-            @NotNull DataCache<?> dataCache,
-            QuerySigningService<?> querySigningService
+            CacheService cacheService
     ) {
         super(
                 next,
@@ -72,8 +73,7 @@ public class CacheWeightCheckRequestHandler extends WeightCheckRequestHandler {
                 queryWeightUtil,
                 mapper
         );
-        this.dataCache = (TupleDataCache<String, Long, String>) dataCache;
-        this.querySigningService = (QuerySigningService<Long>) querySigningService;
+        this.cacheService = cacheService;
     }
 
     @Override
@@ -101,52 +101,45 @@ public class CacheWeightCheckRequestHandler extends WeightCheckRequestHandler {
             LOG.warn("Weight Query json exception:", e);
         }
 
-        CacheService cacheService = new CacheService();
-        String cacheKey = null;
-        try {
-            cacheKey = getKey(druidQuery, mapper, writer);
-        } catch (JsonProcessingException e) {
-            LOG.warn("Cache key cannot be built: ", e);
-        }
-
-        WeightCheckRequestHandler weightCheckRequestHandler =
-                new WeightCheckRequestHandler(next, webService, queryWeightUtil, mapper);
-        SuccessCallback weightQuerySuccess = null;
-        // Construct success callback based on cache hit or cache miss
-        if (context.isReadCache()) {
-            String cacheResponse =
-                    cacheService.readCache(context, dataCache, querySigningService, druidQuery, cacheKey);
-            // Cache hit
-            if (cacheResponse != null) {
-                weightQuerySuccess = buildCacheSuccessCallback(
-                        context,
-                        request,
-                        druidQuery,
-                        weightCheckResponse,
-                        queryRowLimit,
-                        cacheKey,
-                        cacheService,
-                        weightCheckRequestHandler,
-                        false
-                );
-            }
-        } else {
-            // Write to cache
-            weightQuerySuccess = buildCacheSuccessCallback(
-                    context,
-                    request,
-                    druidQuery,
-                    weightCheckResponse,
-                    queryRowLimit,
-                    cacheKey,
-                    cacheService,
-                    weightCheckRequestHandler,
-                    true
-            );
-        }
+        SuccessCallback classicCallback = super.buildSuccessCallback(
+                context,
+                request,
+                druidQuery,
+                weightCheckResponse,
+                queryRowLimit
+        );
         HttpErrorCallback error = response.getErrorCallback(druidQuery);
         FailureCallback failure = response.getFailureCallback(druidQuery);
-        webService.postDruidQuery(context, weightQuerySuccess, error, failure, weightEvaluationQuery);
+
+        SuccessCallback cahingSuccessCallback = buildCacheSuccessCallback(
+                classicCallback,
+                cacheService,
+                druidQuery,
+                weightCheckResponse
+        );
+        // No possible cache hit, so just run the query and save to cache
+        if (!context.isReadCache()) {
+            webService.postDruidQuery(context, cahingSuccessCallback, error, failure, weightEvaluationQuery);
+            return true;
+        }
+
+
+        try {
+            String cacheResponse = cacheService.readCache(context, druidQuery);
+            // There is a cache hit, so no more cache interactions are necessary.
+
+            if (cacheResponse != null) {
+                JsonNode rootNode = mapper.readTree(cacheResponse);
+                classicCallback.invoke(rootNode);
+                return true;
+            }
+        } catch (JsonMappingException e) {
+            e.printStackTrace();
+        } catch (JsonProcessingException e) {
+            e.printStackTrace();
+        }
+
+        webService.postDruidQuery(context, cahingSuccessCallback, error, failure, weightEvaluationQuery);
         return true;
     }
 
@@ -156,70 +149,28 @@ public class CacheWeightCheckRequestHandler extends WeightCheckRequestHandler {
      * HTTP INSUFFICIENT_STORAGE (507)status based on the cardinality of the requester 's query as
      * measured by the weight check query.
      *
-     * @param context  The context data from the request processing chain
-     * @param request  The API request itself
-     * @param druidQuery  The query being processed
-     * @param response  The response handler
-     * @param queryRowLimit  The number of aggregating lines allowed
-     * @param cacheKey Key into which to write a cache entry
-     * @param cacheService CacheService object
-     * @param weightCheckRequestHandler WeightCheckRequestHandler object
-     * @param writeCache Read or Write cache flag
-     *
      * @return The callback handler for the weight request
      */
     protected SuccessCallback buildCacheSuccessCallback(
-            final RequestContext context,
-            final DataApiRequest request,
-            final DruidAggregationQuery<?> druidQuery,
-            final ResponseProcessor response,
-            final long queryRowLimit,
-            final String cacheKey,
-            final CacheService cacheService,
-            final WeightCheckRequestHandler weightCheckRequestHandler,
-            final Boolean writeCache
+            SuccessCallback successCallback,
+            CacheService cacheService,
+            DruidAggregationQuery druidQuery,
+            ResponseProcessor response
     ) {
         return new SuccessCallback() {
-            SuccessCallback superSuccessCallback = weightCheckRequestHandler.buildSuccessCallback(
-                    context,
-                    request,
-                    druidQuery,
-                    response,
-                    queryRowLimit
-            );
             @Override
             public void invoke(JsonNode jsonResult) {
-                if (writeCache) {
-                    cacheService.writeCache(
-                            response,
-                            jsonResult,
-                            dataCache,
-                            druidQuery,
-                            querySigningService,
-                            cacheKey,
-                            writer
-                    );
+                // send the response to the user before waiting to cache
+                successCallback.invoke(jsonResult);
+                try {
+                    cacheService.writeCache(response, jsonResult, druidQuery);
+                } catch (JsonProcessingException e) {
+                    // Warn on cache write exception only
                 }
-                superSuccessCallback.invoke(jsonResult);
             }
         };
-    }
+    };
 
-    /**
-     * Construct the cache key.
-     * Current implementation includes all the fields of the druidQuery besides the context.
-     *
-     * @param druidQuery  The druid query.
-     * @param mapper Mapper
-     * @param writer Writer
-     *
-     * @return The cache key as a String.
-     * @throws JsonProcessingException if the druid query cannot be serialized to JSON
-     */
-    protected String getKey(DruidAggregationQuery<?> druidQuery, ObjectMapper mapper, ObjectWriter writer)
-            throws JsonProcessingException {
-        JsonNode root = mapper.valueToTree(druidQuery);
-        Utils.canonicalize(root , mapper, false);
-        return writer.writeValueAsString(root);
-    }
+    //
+
 }
